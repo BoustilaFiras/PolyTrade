@@ -1,3 +1,0 @@
-- [User Profile](user_profile.md) — Firas uses Node.js at work, prefers it for server-side; Python only for AI/ML
-- [Stack Feedback](feedback_stack.md) — Hybrid Node.js + Python stack, not pure Python
-- [Commit Style](feedback_commits.md) — Short funny commits, co-author is ra3da.tv, never Claude Opus
