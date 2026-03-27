@@ -91,6 +91,4 @@ We welcome contributors! Check the [GitHub Project Board](../../projects) for op
 
 MIT License — see [LICENSE](LICENSE) for details.
 
----
 
-*Built with AI, for traders who think in algorithms.*
