@@ -1,0 +1,217 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Deploy to Production — Manual trigger with approval gate
+# Blue/green deployment with automatic rollback on failure.
+# ──────────────────────────────────────────────────────────────────────────────
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to deploy (release branch or tag)"
+        required: true
+      confirm:
+        description: "Type 'DEPLOY' to confirm production deployment"
+        required: true
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false  # NEVER cancel a production deployment
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/polytrade
+
+jobs:
+  # ── Safety gate ──
+  validate:
+    name: Validate Deployment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "DEPLOY" ]; then
+            echo "❌ Deployment not confirmed. Type 'DEPLOY' to proceed."
+            exit 1
+          fi
+          echo "✅ Deployment confirmed"
+
+      - name: Validate ref
+        run: |
+          REF="${{ github.event.inputs.ref }}"
+          if [[ ! "$REF" =~ ^(release/|v[0-9]) ]]; then
+            echo "⚠️  Warning: deploying non-release ref '${REF}' to production"
+          fi
+
+  # ── Run full test suite before deploying ──
+  pre-deploy-tests:
+    name: Pre-Deploy Test Suite
+    runs-on: ubuntu-latest
+    needs: validate
+    services:
+      timescaledb:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_USER: polytrade
+          POSTGRES_PASSWORD: polytrade_test
+          POSTGRES_DB: polytrade_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U polytrade"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://polytrade:polytrade_test@localhost:5432/polytrade_test
+      REDIS_URL: redis://localhost:6379
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "9"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - uses: astral-sh/setup-uv@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install all dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          cd workers && uv sync --frozen
+
+      - name: Run full TS test suite
+        run: pnpm turbo test:unit test:integration
+
+      - name: Run full Python test suite
+        working-directory: workers
+        run: uv run pytest --tb=short -q
+
+  # ── Blue/green deployment ──
+  deploy:
+    name: Production Deploy (Blue/Green)
+    runs-on: ubuntu-latest
+    needs: pre-deploy-tests
+    environment: production  # requires manual approval in GitHub settings
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Set image tags
+        id: tags
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Deploy (blue/green)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_SERVER_HOST }}
+          username: ${{ secrets.PROD_SERVER_USER }}
+          key: ${{ secrets.PROD_SERVER_SSH_KEY }}
+          script: |
+            set -euo pipefail
+
+            export KUBECONFIG=${{ secrets.PROD_KUBECONFIG_PATH }}
+            export IMAGE_TAG="${{ steps.tags.outputs.sha }}"
+            NAMESPACE="polytrade"
+
+            echo "🚀 Production deployment — SHA: ${IMAGE_TAG}"
+
+            # ── Deploy green version alongside blue ──
+            cd /opt/polytrade/infra/k8s
+
+            kubectl kustomize overlays/production | \
+              sed "s/:latest/:${IMAGE_TAG}/g" | \
+              kubectl apply -f -
+
+            # ── Wait for rollout ──
+            for deploy in api-gateway data-collector strategy-engine execution-engine risk-manager; do
+              echo "Waiting for ${deploy}..."
+              kubectl rollout status deployment/${deploy} -n ${NAMESPACE} --timeout=180s || {
+                echo "❌ Rollout failed for ${deploy} — rolling back"
+                kubectl rollout undo deployment/${deploy} -n ${NAMESPACE}
+                exit 1
+              }
+            done
+
+            echo "✅ Production deployment successful"
+
+      # ── Post-deploy health check ──
+      - name: Health check (5 min observation)
+        run: |
+          echo "🔍 Observing production health for 5 minutes..."
+          PROD_URL="https://${{ secrets.PROD_DOMAIN }}"
+
+          for i in $(seq 1 10); do
+            echo "Check $i/10 ($(date))"
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${PROD_URL}/health" || echo "000")
+
+            if [ "$STATUS" != "200" ]; then
+              echo "❌ Health check failed (HTTP $STATUS) — triggering rollback"
+              exit 1
+            fi
+            echo "  ✅ HTTP $STATUS"
+            sleep 30
+          done
+
+          echo "✅ Production is healthy"
+
+      - name: Auto-rollback on failure
+        if: failure()
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_SERVER_HOST }}
+          username: ${{ secrets.PROD_SERVER_USER }}
+          key: ${{ secrets.PROD_SERVER_SSH_KEY }}
+          script: |
+            export KUBECONFIG=${{ secrets.PROD_KUBECONFIG_PATH }}
+            NAMESPACE="polytrade"
+
+            echo "⚠️  Rolling back production deployment..."
+            for deploy in api-gateway data-collector strategy-engine execution-engine risk-manager; do
+              kubectl rollout undo deployment/${deploy} -n ${NAMESPACE} || true
+            done
+
+            echo "✅ Rollback complete"
+
+      - name: Post deployment summary
+        if: always()
+        run: |
+          echo "## 🏭 Production Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Ref** | \`${{ github.event.inputs.ref }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **SHA** | \`${{ steps.tags.outputs.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Actor** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | production |" >> $GITHUB_STEP_SUMMARY
