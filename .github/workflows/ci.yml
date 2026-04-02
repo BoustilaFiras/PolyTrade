@@ -1,0 +1,385 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# CI Pipeline — PolyTrade Monorepo
+# Runs on every PR and push to main.
+# Steps: lint → type-check → unit tests → integration tests → build → push
+# ──────────────────────────────────────────────────────────────────────────────
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write          # push to GHCR
+
+env:
+  NODE_VERSION: "22"
+  PYTHON_VERSION: "3.12"
+  PNPM_VERSION: "9"
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/polytrade
+
+# ─────────────────────────────────── JOBS ────────────────────────────────────
+
+jobs:
+  # ╔══════════════════════════════════════════════════════════════════════════╗
+  # ║  CHANGES — detect which parts of the monorepo changed                  ║
+  # ╚══════════════════════════════════════════════════════════════════════════╝
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      typescript: ${{ steps.filter.outputs.typescript }}
+      python:     ${{ steps.filter.outputs.python }}
+      docker:     ${{ steps.filter.outputs.docker }}
+      infra:      ${{ steps.filter.outputs.infra }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            typescript:
+              - 'apps/**'
+              - 'packages/**'
+              - 'pnpm-workspace.yaml'
+              - 'turbo.json'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'tsconfig*.json'
+            python:
+              - 'workers/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+            docker:
+              - 'infra/docker/**'
+              - 'docker-compose*.yml'
+            infra:
+              - 'infra/**'
+
+  # ╔══════════════════════════════════════════════════════════════════════════╗
+  # ║  TYPESCRIPT — lint + type-check + unit tests                           ║
+  # ╚══════════════════════════════════════════════════════════════════════════╝
+  typescript-checks:
+    name: "TS: Lint & Type Check"
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.typescript == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (ESLint)
+        run: pnpm turbo lint
+
+      - name: Type check (tsc --noEmit)
+        run: pnpm turbo typecheck
+
+  typescript-unit-tests:
+    name: "TS: Unit Tests (Vitest)"
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.typescript == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run unit tests
+        run: pnpm turbo test:unit
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ts-coverage
+          path: "**/coverage/"
+          retention-days: 7
+
+  # ╔══════════════════════════════════════════════════════════════════════════╗
+  # ║  PYTHON — lint + type-check + unit tests                               ║
+  # ╚══════════════════════════════════════════════════════════════════════════╝
+  python-checks:
+    name: "PY: Lint & Type Check"
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        working-directory: workers
+        run: uv sync --frozen
+
+      - name: Lint (Ruff)
+        working-directory: workers
+        run: uv run ruff check .
+
+      - name: Format check (Ruff)
+        working-directory: workers
+        run: uv run ruff format --check .
+
+      - name: Type check (mypy)
+        working-directory: workers
+        run: uv run mypy .
+
+  python-unit-tests:
+    name: "PY: Unit Tests (pytest)"
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        working-directory: workers
+        run: uv sync --frozen
+
+      - name: Run unit tests
+        working-directory: workers
+        run: uv run pytest --tb=short --cov --cov-report=xml --cov-report=term-missing -q
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: py-coverage
+          path: workers/coverage.xml
+          retention-days: 7
+
+  # ╔══════════════════════════════════════════════════════════════════════════╗
+  # ║  INTEGRATION TESTS — with Docker services (TimescaleDB, Redis)         ║
+  # ╚══════════════════════════════════════════════════════════════════════════╝
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [typescript-checks, python-checks]
+    if: |
+      always() &&
+      !contains(needs.*.result, 'failure') &&
+      (needs.changes.outputs.typescript == 'true' || needs.changes.outputs.python == 'true')
+    services:
+      timescaledb:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_USER: polytrade
+          POSTGRES_PASSWORD: polytrade_test
+          POSTGRES_DB: polytrade_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U polytrade"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://polytrade:polytrade_test@localhost:5432/polytrade_test
+      REDIS_URL: redis://localhost:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Node.js setup ──
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install Node.js dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ── Python setup ──
+      - uses: astral-sh/setup-uv@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python dependencies
+        working-directory: workers
+        run: uv sync --frozen
+
+      # ── Run integration tests ──
+      - name: Run TS integration tests
+        run: pnpm turbo test:integration
+
+      - name: Run Python integration tests
+        working-directory: workers
+        run: uv run pytest tests/integration --tb=short -q
+
+  # ╔══════════════════════════════════════════════════════════════════════════╗
+  # ║  DOCKER BUILD — build and push images to GHCR                          ║
+  # ╚══════════════════════════════════════════════════════════════════════════╝
+  docker-build:
+    name: "Docker: Build & Push"
+    runs-on: ubuntu-latest
+    needs: [typescript-unit-tests, python-unit-tests, integration-tests]
+    if: |
+      always() &&
+      !contains(needs.*.result, 'failure') &&
+      github.event_name == 'push'
+    strategy:
+      matrix:
+        service:
+          - name: api-gateway
+            dockerfile: infra/docker/Dockerfile.api-gateway
+            context: .
+          - name: data-collector
+            dockerfile: infra/docker/Dockerfile.data-collector
+            context: .
+          - name: strategy-engine
+            dockerfile: infra/docker/Dockerfile.strategy-engine
+            context: .
+          - name: execution-engine
+            dockerfile: infra/docker/Dockerfile.execution-engine
+            context: .
+          - name: risk-manager
+            dockerfile: infra/docker/Dockerfile.risk-manager
+            context: .
+          - name: ml-inference
+            dockerfile: infra/docker/Dockerfile.ml-inference
+            context: .
+          - name: backtester
+            dockerfile: infra/docker/Dockerfile.backtester
+            context: .
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if Dockerfile exists
+        id: check
+        run: |
+          if [ -f "${{ matrix.service.dockerfile }}" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️  Skipping ${{ matrix.service.name }} — Dockerfile not found"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.exists == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.check.outputs.exists == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        if: steps.check.outputs.exists == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}/${{ matrix.service.name }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        if: steps.check.outputs.exists == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.service.context }}
+          file: ${{ matrix.service.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ╔══════════════════════════════════════════════════════════════════════════╗
+  # ║  CI SUMMARY — final gate for branch protection                         ║
+  # ╚══════════════════════════════════════════════════════════════════════════╝
+  ci-passed:
+    name: CI ✅
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - typescript-checks
+      - typescript-unit-tests
+      - python-checks
+      - python-unit-tests
+      - integration-tests
+      - docker-build
+    steps:
+      - name: Check all jobs
+        run: |
+          echo "TypeScript checks: ${{ needs.typescript-checks.result }}"
+          echo "TypeScript tests:  ${{ needs.typescript-unit-tests.result }}"
+          echo "Python checks:     ${{ needs.python-checks.result }}"
+          echo "Python tests:      ${{ needs.python-unit-tests.result }}"
+          echo "Integration tests: ${{ needs.integration-tests.result }}"
+          echo "Docker build:      ${{ needs.docker-build.result }}"
+
+          # Fail if any required job failed (skipped is OK — means no changes)
+          if [[ "${{ needs.typescript-checks.result }}" == "failure" ]] ||
+             [[ "${{ needs.typescript-unit-tests.result }}" == "failure" ]] ||
+             [[ "${{ needs.python-checks.result }}" == "failure" ]] ||
+             [[ "${{ needs.python-unit-tests.result }}" == "failure" ]] ||
+             [[ "${{ needs.integration-tests.result }}" == "failure" ]] ||
+             [[ "${{ needs.docker-build.result }}" == "failure" ]]; then
+            echo "❌ One or more jobs failed."
+            exit 1
+          fi
+
+          echo "✅ All checks passed!"

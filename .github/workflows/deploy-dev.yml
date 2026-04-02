@@ -1,0 +1,109 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Deploy to Dev — Auto-deploy on merge to main
+# Pulls latest Docker images from GHCR and deploys to the dev server.
+# ──────────────────────────────────────────────────────────────────────────────
+name: Deploy to Dev
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:       # allow manual trigger
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false  # never cancel a running deployment
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/polytrade
+
+jobs:
+  deploy:
+    name: Deploy to Dev
+    runs-on: ubuntu-latest
+    environment: dev       # GitHub environment with protection rules
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Generate image tags from the commit SHA ──
+      - name: Set image tags
+        id: tags
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Deploying SHA: ${SHORT_SHA}"
+
+      # ── Deploy via SSH ──
+      - name: Deploy to dev server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEV_SERVER_HOST }}
+          username: ${{ secrets.DEV_SERVER_USER }}
+          key: ${{ secrets.DEV_SERVER_SSH_KEY }}
+          script: |
+            set -euo pipefail
+
+            echo "📦 Deploying PolyTrade to dev — SHA: ${{ steps.tags.outputs.sha }}"
+
+            # Navigate to project directory
+            cd /opt/polytrade
+
+            # Pull latest compose file
+            git fetch origin main
+            git reset --hard origin/main
+
+            # Log in to GHCR
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # Export image tags for docker compose
+            export IMAGE_TAG="${{ steps.tags.outputs.sha }}"
+            export IMAGE_PREFIX="${{ env.IMAGE_PREFIX }}"
+
+            # Pull latest images
+            docker compose -f docker-compose.yml -f docker-compose.dev.yml pull
+
+            # Apply database migrations
+            docker compose -f docker-compose.yml -f docker-compose.dev.yml run --rm \
+              api-gateway pnpm run db:migrate
+
+            # Rolling restart services
+            docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d \
+              --remove-orphans \
+              --wait
+
+            echo "✅ Deployment complete"
+
+      # ── Smoke test ──
+      - name: Smoke test
+        run: |
+          echo "🔍 Running smoke tests against dev..."
+          sleep 15  # wait for services to stabilize
+
+          # Health check endpoint
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "http://${{ secrets.DEV_SERVER_HOST }}:3000/health" || echo "000")
+
+          if [ "$STATUS" = "200" ]; then
+            echo "✅ Health check passed (HTTP $STATUS)"
+          else
+            echo "❌ Health check failed (HTTP $STATUS)"
+            exit 1
+          fi
+
+      # ── Notify ──
+      - name: Post deployment summary
+        if: always()
+        run: |
+          echo "## 🚀 Dev Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Actor** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
